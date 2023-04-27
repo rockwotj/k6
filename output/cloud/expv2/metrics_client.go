@@ -2,110 +2,116 @@ package expv2
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
-	easyjson "github.com/mailru/easyjson"
+	"github.com/golang/snappy"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 
-	"go.k6.io/k6/cloudapi"
+	"go.k6.io/k6/lib/consts"
+	"go.k6.io/k6/output/cloud/expv2/pbcloud"
 )
+
+type httpDoer interface {
+	Do(*http.Request) (*http.Response, error)
+}
 
 // MetricsClient is a wrapper around the cloudapi.Client that is also capable of pushing
 type MetricsClient struct {
-	*cloudapi.Client
+	httpClient httpDoer
 	logger     logrus.FieldLogger
-	host       string
-	noCompress bool
+	token      string
+	userAgent  string
 
 	pushBufferPool sync.Pool
+	baseURL        string
 }
 
 // NewMetricsClient creates and initializes a new MetricsClient.
-func NewMetricsClient(client *cloudapi.Client, logger logrus.FieldLogger, host string, noCompress bool) *MetricsClient {
+func NewMetricsClient(logger logrus.FieldLogger, host string, token string) (*MetricsClient, error) {
+	if host == "" {
+		return nil, errors.New("host is required")
+	}
+	if token == "" {
+		return nil, errors.New("token is required")
+	}
 	return &MetricsClient{
-		Client:     client,
+		httpClient: &http.Client{Timeout: 5 * time.Second},
 		logger:     logger,
-		host:       host,
-		noCompress: noCompress,
+		baseURL:    host + "/v2/metrics/",
+		token:      token,
+		userAgent:  "k6cloud/v" + consts.Version,
 		pushBufferPool: sync.Pool{
 			New: func() interface{} {
 				return &bytes.Buffer{}
 			},
 		},
-	}
+	}, nil
 }
 
-// PushMetric pushes the provided metric samples for the given referenceID
-func (mc *MetricsClient) PushMetric(referenceID string, s []*Sample) error {
+// Push pushes the provided metric samples for the given referenceID
+func (mc *MetricsClient) Push(ctx context.Context, referenceID string, samples *pbcloud.MetricSet) error {
+	if referenceID == "" {
+		return errors.New("a Reference ID of the test run is required")
+	}
 	start := time.Now()
-	url := fmt.Sprintf("%s/v1/metrics/%s", mc.host, referenceID)
 
-	jsonStart := time.Now()
-	b, err := easyjson.Marshal(samples(s))
-	if err != nil {
-		return err
-	}
-	jsonTime := time.Since(jsonStart)
-
-	// TODO: change the context, maybe to one with a timeout
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, nil)
+	b, err := newRequestBody(samples)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("X-Payload-Sample-Count", strconv.Itoa(len(s)))
-	var additionalFields logrus.Fields
+	buf, _ := mc.pushBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer mc.pushBufferPool.Put(buf)
 
-	if !mc.noCompress {
-		buf := mc.pushBufferPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		defer mc.pushBufferPool.Put(buf)
-		unzippedSize := len(b)
-		buf.Grow(unzippedSize / expectedGzipRatio)
-		gzipStart := time.Now()
-		{
-			g, _ := gzip.NewWriterLevel(buf, gzip.BestSpeed)
-			if _, err = g.Write(b); err != nil {
-				return err
-			}
-			if err = g.Close(); err != nil {
-				return err
-			}
-		}
-		gzipTime := time.Since(gzipStart)
-
-		req.Header.Set("Content-Encoding", "gzip")
-		req.Header.Set("X-Payload-Byte-Count", strconv.Itoa(unzippedSize))
-
-		additionalFields = logrus.Fields{
-			"unzipped_size":  unzippedSize,
-			"gzip_t":         gzipTime,
-			"content_length": buf.Len(),
-		}
-
-		b = buf.Bytes()
+	_, err = buf.Write(b)
+	if err != nil {
+		return err
+	}
+	// TODO: it is always the same
+	// we don't expect to share this client across different refID
+	// with a bit of effort we can find a way to just allocate once
+	url := mc.baseURL + referenceID
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, buf)
+	if err != nil {
+		return err
 	}
 
-	req.Header.Set("Content-Length", strconv.Itoa(len(b)))
-	req.Body = io.NopCloser(bytes.NewReader(b))
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(b)), nil
+	req.Header.Set("User-Agent", mc.userAgent)
+	req.Header.Set("Content-Type", "application/x-protobuf")
+	req.Header.Set("Content-Encoding", "snappy")
+	req.Header.Set("K6-Metrics-Protocol-Version", "2.0")
+	req.Header.Set("Authorization", "Token "+mc.token)
+
+	resp, err := mc.httpClient.Do(req)
+	if err != nil {
+		return err
 	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("response got an unexpected status code: %s", resp.Status)
+	}
+	mc.logger.WithField("t", time.Since(start)).WithField("size", len(b)).
+		Debug("Pushed part to cloud")
+	return nil
+}
 
-	err = mc.Client.Do(req, nil)
-
-	mc.logger.WithFields(logrus.Fields{
-		"t":         time.Since(start),
-		"json_t":    jsonTime,
-		"part_size": len(s),
-	}).WithFields(additionalFields).Debug("Pushed part to cloud")
-
-	return err
+func newRequestBody(data *pbcloud.MetricSet) ([]byte, error) {
+	b, err := proto.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("encoding series as protobuf write request failed: %w", err)
+	}
+	if snappy.MaxEncodedLen(len(b)) < 0 {
+		return nil, fmt.Errorf("the protobuf message is too large to be handled by Snappy encoder; "+
+			"size: %d, limit: %d", len(b), 0xffffffff)
+	}
+	return snappy.Encode(nil, b), nil
 }
