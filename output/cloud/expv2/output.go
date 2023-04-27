@@ -1,27 +1,27 @@
 package expv2
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
-	easyjson "github.com/mailru/easyjson"
+	"github.com/mstoykov/atlas"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/guregu/null.v3"
 
 	"go.k6.io/k6/cloudapi"
 	"go.k6.io/k6/errext"
 	"go.k6.io/k6/errext/exitcodes"
 	"go.k6.io/k6/output"
+	"go.k6.io/k6/output/cloud/expv2/pbcloud"
 
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/lib/consts"
-	"go.k6.io/k6/lib/netext"
-	"go.k6.io/k6/lib/netext/httpext"
 	"go.k6.io/k6/metrics"
 )
 
@@ -30,47 +30,32 @@ const TestName = "k6 test"
 
 // Output sends result data to the k6 Cloud service.
 type Output struct {
-	config      cloudapi.Config
-	referenceID string
-
-	executionPlan []lib.ExecutionStep
-	duration      int64 // in seconds
-	thresholds    map[string][]*metrics.Threshold
-	client        *MetricsClient
-
-	bufferMutex      sync.Mutex
-	bufferHTTPTrails []*httpext.Trail
-	bufferSamples    []*Sample
+	output.SampleBuffer
 
 	logger logrus.FieldLogger
 	opts   lib.Options
+	config cloudapi.Config
 
-	// TODO: optimize this
-	//
-	// Since the real-time metrics refactoring (https://github.com/k6io/k6/pull/678),
-	// we should no longer have to handle metrics that have times long in the past. So instead of a
-	// map, we can probably use a simple slice (or even an array!) as a ring buffer to store the
-	// aggregation buckets. This should save us a some time, since it would make the lookups and WaitPeriod
-	// checks basically O(1). And even if for some reason there are occasional metrics with past times that
-	// don't fit in the chosen ring buffer size, we could just send them along to the buffer unaggregated
-	aggrBuckets map[int64]aggregationBucket
+	referenceID   string
+	executionPlan []lib.ExecutionStep
+	duration      int64 // in seconds
+	thresholds    map[string][]*metrics.Threshold
 
-	stopSendingMetrics chan struct{}
-	stopAggregation    chan struct{}
-	aggregationDone    *sync.WaitGroup
-	stopOutput         chan struct{}
-	outputDone         *sync.WaitGroup
+	metricsClient *MetricsClient
+	testsClient   *cloudapi.Client
+
+	periodicFlusher *output.PeriodicFlusher
+
+	// TODO: if the metric refactor (#2905) will introduce
+	// a sequential ID for metrics
+	// then we could reuse the same strategy here
+	activeSeries map[*metrics.Metric]aggregatedSamples
+
 	testStopFunc       func(error)
+	stopSendingMetrics chan struct{}
 }
 
-// Verify that Output implements the wanted interfaces
-var _ interface {
-	output.WithStopWithTestError
-	output.WithThresholds
-	output.WithTestRunStop
-} = &Output{}
-
-// New creates a new Cloud output version 1.
+// New creates a new Cloud output version 2.
 func New(params output.Params) (*Output, error) {
 	conf, err := cloudapi.GetConsolidatedConfig(
 		params.JSONConfig, params.Environment, params.ConfigArgument, params.ScriptOptions.External)
@@ -102,33 +87,28 @@ func New(params output.Params) (*Output, error) {
 		return nil, errors.New("tests with unspecified duration are not allowed when outputting data to k6 cloud")
 	}
 
-	if !(conf.MetricPushConcurrency.Int64 > 0) {
-		return nil, fmt.Errorf("metrics push concurrency must be a positive number but is %d",
-			conf.MetricPushConcurrency.Int64)
-	}
+	// TODO: evaluate to introduce concurrent flush
+	//
+	//if !(conf.MetricPushConcurrency.Int64 > 0) {
+	//return nil, fmt.Errorf("metrics push concurrency must be a positive number but is %d",
+	//conf.MetricPushConcurrency.Int64)
+	//}
 
-	if !(conf.MaxMetricSamplesPerPackage.Int64 > 0) {
-		return nil, fmt.Errorf("metric samples per package must be a positive number but is %d",
-			conf.MaxMetricSamplesPerPackage.Int64)
+	metricsClient, err := NewMetricsClient(logger, conf.Host.String, conf.Token.String)
+	if err != nil {
+		return nil, err
 	}
-
-	apiClient := cloudapi.NewClient(
-		logger, conf.Token.String, conf.Host.String, consts.Version, conf.Timeout.TimeDuration())
 
 	return &Output{
-		config:        conf,
-		client:        NewMetricsClient(apiClient, logger, conf.Host.String, conf.NoCompress.Bool),
-		executionPlan: params.ExecutionPlan,
-		duration:      int64(duration / time.Second),
-		opts:          params.ScriptOptions,
-		aggrBuckets:   map[int64]aggregationBucket{},
-		logger:        logger,
-
+		logger: logger,
+		config: conf,
+		opts:   params.ScriptOptions,
+		testsClient: cloudapi.NewClient(
+			logger, conf.Token.String, conf.Host.String, consts.Version, conf.Timeout.TimeDuration()),
+		metricsClient:      metricsClient,
+		executionPlan:      params.ExecutionPlan,
+		duration:           int64(duration / time.Second),
 		stopSendingMetrics: make(chan struct{}),
-		stopAggregation:    make(chan struct{}),
-		aggregationDone:    &sync.WaitGroup{},
-		stopOutput:         make(chan struct{}),
-		outputDone:         &sync.WaitGroup{},
 	}, nil
 }
 
@@ -182,7 +162,7 @@ func (out *Output) Start() error {
 		Duration:   out.duration,
 	}
 
-	response, err := out.client.CreateTestRun(testRun)
+	response, err := out.testsClient.CreateTestRun(testRun)
 	if err != nil {
 		return err
 	}
@@ -206,52 +186,17 @@ func (out *Output) Start() error {
 	return nil
 }
 
-func (out *Output) startBackgroundProcesses() {
-	aggregationPeriod := out.config.AggregationPeriod.TimeDuration()
-	// If enabled, start periodically aggregating the collected HTTP trails
-	if aggregationPeriod > 0 {
-		out.aggregationDone.Add(1)
-		go func() {
-			defer out.aggregationDone.Done()
-			aggregationWaitPeriod := out.config.AggregationWaitPeriod.TimeDuration()
-			aggregationTicker := time.NewTicker(aggregationPeriod)
-			defer aggregationTicker.Stop()
+func (o *Output) startBackgroundProcesses() error {
+	// TODO: Implement a new time series based cloud aggregation
+	// https://github.com/grafana/k6/issues/1700
 
-			for {
-				select {
-				case <-out.stopSendingMetrics:
-					return
-				case <-aggregationTicker.C:
-					out.aggregateHTTPTrails(aggregationWaitPeriod)
-				case <-out.stopAggregation:
-					out.aggregateHTTPTrails(0)
-					out.flushHTTPTrails()
-					return
-				}
-			}
-		}()
+	pf, err := output.NewPeriodicFlusher(o.config.MetricPushInterval.TimeDuration(), o.flushMetrics)
+	if err != nil {
+		return err
 	}
 
-	out.outputDone.Add(1)
-	go func() {
-		defer out.outputDone.Done()
-		pushTicker := time.NewTicker(out.config.MetricPushInterval.TimeDuration())
-		defer pushTicker.Stop()
-		for {
-			select {
-			case <-out.stopSendingMetrics:
-				return
-			default:
-			}
-			select {
-			case <-out.stopOutput:
-				out.pushMetrics()
-				return
-			case <-pushTicker.C:
-				out.pushMetrics()
-			}
-		}
-	}()
+	o.periodicFlusher = pf
+	return nil
 }
 
 // Stop gracefully stops all metric emission from the output: when all metric
@@ -265,19 +210,16 @@ func (out *Output) Stop() error {
 // StopWithTestError gracefully stops all metric emission from the output: when
 // all metric samples are emitted, it makes a cloud API call to finish the test
 // run. If testErr was specified, it extracts the RunStatus from it.
-func (out *Output) StopWithTestError(testErr error) error {
-	out.logger.Debug("Stopping the cloud output...")
-	close(out.stopAggregation)
-	out.aggregationDone.Wait() // could be a no-op, if we have never started the aggregation
-	out.logger.Debug("Aggregation stopped, stopping metric emission...")
-	close(out.stopOutput)
-	out.outputDone.Wait()
-	out.logger.Debug("Metric emission stopped, calling cloud API...")
-	err := out.testFinished(testErr)
+func (o *Output) StopWithTestError(testErr error) error {
+	o.logger.Debug("Stopping the cloud output...")
+	o.periodicFlusher.Stop()
+
+	o.logger.Debug("Metric emission stopped, calling cloud API...")
+	err := o.testFinished(testErr)
 	if err != nil {
-		out.logger.WithFields(logrus.Fields{"error": err}).Warn("Failed to send test finished to the cloud")
+		o.logger.WithFields(logrus.Fields{"error": err}).Warn("Failed to send test finished to the cloud")
 	} else {
-		out.logger.Debug("Cloud output successfully stopped!")
+		o.logger.Debug("Cloud output successfully stopped!")
 	}
 	return err
 }
@@ -350,225 +292,6 @@ func (out *Output) SetTestRunStopCallback(stopFunc func(error)) {
 	out.testStopFunc = stopFunc
 }
 
-// AddMetricSamples receives a set of metric samples. This method is never
-// called concurrently, so it defers as much of the work as possible to the
-// asynchronous goroutines initialized in Start().
-func (out *Output) AddMetricSamples(sampleContainers []metrics.SampleContainer) {
-	select {
-	case <-out.stopSendingMetrics:
-		return
-	default:
-	}
-
-	if out.referenceID == "" {
-		return
-	}
-
-	newSamples := []*Sample{}
-	newHTTPTrails := []*httpext.Trail{}
-
-	for _, sampleContainer := range sampleContainers {
-		switch sc := sampleContainer.(type) {
-		case *httpext.Trail:
-			// Check if aggregation is enabled,
-			if out.config.AggregationPeriod.Duration > 0 {
-				newHTTPTrails = append(newHTTPTrails, sc)
-			} else {
-				newSamples = append(newSamples, NewSampleFromTrail(sc))
-			}
-		case *netext.NetTrail:
-			// TODO: aggregate?
-			values := map[string]float64{
-				metrics.DataSentName:     float64(sc.BytesWritten),
-				metrics.DataReceivedName: float64(sc.BytesRead),
-			}
-
-			if sc.FullIteration {
-				values[metrics.IterationDurationName] = metrics.D(sc.EndTime.Sub(sc.StartTime))
-				values[metrics.IterationsName] = 1
-			}
-
-			encodedTags, err := easyjson.Marshal(sc.GetTags())
-			if err != nil {
-				out.logger.WithError(err).Error("Encoding tags failed")
-			}
-			newSamples = append(newSamples, &Sample{
-				Type:   DataTypeMap,
-				Metric: "iter_li_all",
-				Data: &SampleDataMap{
-					Time:   toMicroSecond(sc.GetTime()),
-					Tags:   encodedTags,
-					Values: values,
-				},
-			})
-		default:
-			for _, sample := range sampleContainer.GetSamples() {
-				encodedTags, err := easyjson.Marshal(sample.Tags)
-				if err != nil {
-					out.logger.WithError(err).Error("Encoding tags failed")
-				}
-
-				newSamples = append(newSamples, &Sample{
-					Type:   DataTypeSingle,
-					Metric: sample.Metric.Name,
-					Data: &SampleDataSingle{
-						Type:  sample.Metric.Type,
-						Time:  toMicroSecond(sample.Time),
-						Tags:  encodedTags,
-						Value: sample.Value,
-					},
-				})
-			}
-		}
-	}
-
-	if len(newSamples) > 0 || len(newHTTPTrails) > 0 {
-		out.bufferMutex.Lock()
-		out.bufferSamples = append(out.bufferSamples, newSamples...)
-		out.bufferHTTPTrails = append(out.bufferHTTPTrails, newHTTPTrails...)
-		out.bufferMutex.Unlock()
-	}
-}
-
-//nolint:funlen,nestif,gocognit
-func (out *Output) aggregateHTTPTrails(waitPeriod time.Duration) {
-	out.bufferMutex.Lock()
-	newHTTPTrails := out.bufferHTTPTrails
-	out.bufferHTTPTrails = nil
-	out.bufferMutex.Unlock()
-
-	aggrPeriod := int64(out.config.AggregationPeriod.Duration)
-
-	// Distribute all newly buffered HTTP trails into buckets and sub-buckets
-	for _, trail := range newHTTPTrails {
-		bucketID := trail.GetTime().UnixNano() / aggrPeriod
-
-		// Get or create a time bucket for that trail period
-		bucket, ok := out.aggrBuckets[bucketID]
-		if !ok {
-			bucket = aggregationBucket{}
-			out.aggrBuckets[bucketID] = bucket
-		}
-
-		subBucket, ok := bucket[trail.Tags]
-		if !ok {
-			subBucket = make([]*httpext.Trail, 0, 100)
-		}
-		bucket[trail.Tags] = append(subBucket, trail)
-	}
-
-	// Which buckets are still new and we'll wait for trails to accumulate before aggregating
-	bucketCutoffID := time.Now().Add(-waitPeriod).UnixNano() / aggrPeriod
-	iqrRadius := out.config.AggregationOutlierIqrRadius.Float64
-	iqrLowerCoef := out.config.AggregationOutlierIqrCoefLower.Float64
-	iqrUpperCoef := out.config.AggregationOutlierIqrCoefUpper.Float64
-	newSamples := []*Sample{}
-
-	// Handle all aggregation buckets older than bucketCutoffID
-	for bucketID, subBucket := range out.aggrBuckets {
-		if bucketID > bucketCutoffID {
-			continue
-		}
-
-		for tags, httpTrails := range subBucket {
-			// start := time.Now() // this is in a combination with the log at the end
-			trailCount := int64(len(httpTrails))
-			if trailCount < out.config.AggregationMinSamples.Int64 {
-				for _, trail := range httpTrails {
-					newSamples = append(newSamples, NewSampleFromTrail(trail))
-				}
-				continue
-			}
-			encodedTags, err := easyjson.Marshal(tags)
-			if err != nil {
-				out.logger.WithError(err).Error("Encoding tags failed")
-			}
-
-			aggrData := &SampleDataAggregatedHTTPReqs{
-				Time: toMicroSecond(time.Unix(0, bucketID*aggrPeriod+aggrPeriod/2)),
-				Type: "aggregated_trend",
-				Tags: encodedTags,
-			}
-
-			if out.config.AggregationSkipOutlierDetection.Bool {
-				// Simply add up all HTTP trails, no outlier detection
-				for _, trail := range httpTrails {
-					aggrData.Add(trail)
-				}
-			} else {
-				connDurations := make(durations, trailCount)
-				reqDurations := make(durations, trailCount)
-				for i, trail := range httpTrails {
-					connDurations[i] = trail.ConnDuration
-					reqDurations[i] = trail.Duration
-				}
-
-				var minConnDur, maxConnDur, minReqDur, maxReqDur time.Duration
-				if trailCount < out.config.AggregationOutlierAlgoThreshold.Int64 {
-					// Since there are fewer samples, we'll use the interpolation-enabled and
-					// more precise sorting-based algorithm
-					minConnDur, maxConnDur = connDurations.SortGetNormalBounds(iqrRadius, iqrLowerCoef, iqrUpperCoef, true)
-					minReqDur, maxReqDur = reqDurations.SortGetNormalBounds(iqrRadius, iqrLowerCoef, iqrUpperCoef, true)
-				} else {
-					minConnDur, maxConnDur = connDurations.SelectGetNormalBounds(iqrRadius, iqrLowerCoef, iqrUpperCoef)
-					minReqDur, maxReqDur = reqDurations.SelectGetNormalBounds(iqrRadius, iqrLowerCoef, iqrUpperCoef)
-				}
-
-				for _, trail := range httpTrails {
-					if trail.ConnDuration < minConnDur ||
-						trail.ConnDuration > maxConnDur ||
-						trail.Duration < minReqDur ||
-						trail.Duration > maxReqDur {
-						// Seems like an outlier, add it as a standalone metric
-						newSamples = append(newSamples, NewSampleFromTrail(trail))
-					} else {
-						// Aggregate the trail
-						aggrData.Add(trail)
-					}
-				}
-			}
-
-			aggrData.CalcAverages()
-
-			if aggrData.Count > 0 {
-				newSamples = append(newSamples, &Sample{
-					Type:   DataTypeAggregatedHTTPReqs,
-					Metric: "http_req_li_all",
-					Data:   aggrData,
-				})
-			}
-		}
-		delete(out.aggrBuckets, bucketID)
-	}
-
-	if len(newSamples) > 0 {
-		out.bufferMutex.Lock()
-		out.bufferSamples = append(out.bufferSamples, newSamples...)
-		out.bufferMutex.Unlock()
-	}
-}
-
-func (out *Output) flushHTTPTrails() {
-	out.bufferMutex.Lock()
-	defer out.bufferMutex.Unlock()
-
-	newSamples := []*Sample{}
-	for _, trail := range out.bufferHTTPTrails {
-		newSamples = append(newSamples, NewSampleFromTrail(trail))
-	}
-	for _, bucket := range out.aggrBuckets {
-		for _, subBucket := range bucket {
-			for _, trail := range subBucket {
-				newSamples = append(newSamples, NewSampleFromTrail(trail))
-			}
-		}
-	}
-
-	out.bufferHTTPTrails = nil
-	out.aggrBuckets = map[int64]aggregationBucket{}
-	out.bufferSamples = append(out.bufferSamples, newSamples...)
-}
-
 func (out *Output) shouldStopSendingMetrics(err error) bool {
 	if err == nil {
 		return false
@@ -581,95 +304,8 @@ func (out *Output) shouldStopSendingMetrics(err error) bool {
 	return false
 }
 
-type pushJob struct {
-	done    chan error
-	samples []*Sample
-}
-
-// ceil(a/b)
-func ceilDiv(a, b int) int {
-	r := a / b
-	if a%b != 0 {
-		r++
-	}
-	return r
-}
-
-func (out *Output) pushMetrics() {
-	out.bufferMutex.Lock()
-	if len(out.bufferSamples) == 0 {
-		out.bufferMutex.Unlock()
-		return
-	}
-	buffer := out.bufferSamples
-	out.bufferSamples = nil
-	out.bufferMutex.Unlock()
-
-	count := len(buffer)
-	out.logger.WithFields(logrus.Fields{
-		"samples": count,
-	}).Debug("Pushing metrics to cloud")
-	start := time.Now()
-
-	numberOfPackages := ceilDiv(len(buffer), int(out.config.MaxMetricSamplesPerPackage.Int64))
-	numberOfWorkers := int(out.config.MetricPushConcurrency.Int64)
-	if numberOfWorkers > numberOfPackages {
-		numberOfWorkers = numberOfPackages
-	}
-
-	ch := make(chan pushJob, numberOfPackages)
-	for i := 0; i < numberOfWorkers; i++ {
-		go func() {
-			for job := range ch {
-				err := out.client.PushMetric(out.referenceID, job.samples)
-				job.done <- err
-				if out.shouldStopSendingMetrics(err) {
-					return
-				}
-			}
-		}()
-	}
-
-	jobs := make([]pushJob, 0, numberOfPackages)
-
-	for len(buffer) > 0 {
-		size := len(buffer)
-		if size > int(out.config.MaxMetricSamplesPerPackage.Int64) {
-			size = int(out.config.MaxMetricSamplesPerPackage.Int64)
-		}
-		job := pushJob{done: make(chan error, 1), samples: buffer[:size]}
-		ch <- job
-		jobs = append(jobs, job)
-		buffer = buffer[size:]
-	}
-
-	close(ch)
-
-	for _, job := range jobs {
-		err := <-job.done
-		if err != nil {
-			if out.shouldStopSendingMetrics(err) {
-				out.logger.WithError(err).Warn("Stopped sending metrics to cloud due to an error")
-				serr := errext.WithAbortReasonIfNone(
-					errext.WithExitCodeIfNone(err, exitcodes.ExternalAbort),
-					errext.AbortedByOutput,
-				)
-				if out.config.StopOnError.Bool {
-					out.testStopFunc(serr)
-				}
-				close(out.stopSendingMetrics)
-				break
-			}
-			out.logger.WithError(err).Warn("Failed to send metrics to cloud")
-		}
-	}
-	out.logger.WithFields(logrus.Fields{
-		"samples": count,
-		"t":       time.Since(start),
-	}).Debug("Pushing metrics to cloud finished")
-}
-
 func (out *Output) testFinished(testErr error) error {
+	// TODO: why do we need to check the config also?
 	if out.referenceID == "" || out.config.PushRefID.Valid {
 		return nil
 	}
@@ -693,7 +329,209 @@ func (out *Output) testFinished(testErr error) error {
 		"run_status": runStatus,
 	}).Debug("Sending test finished")
 
-	return out.client.TestFinished(out.referenceID, thresholdResults, testTainted, runStatus)
+	return out.testsClient.TestFinished(out.referenceID, thresholdResults, testTainted, runStatus)
 }
 
-const expectedGzipRatio = 6 // based on test it is around 6.8, but we don't need to be that accurate
+func (o *Output) flushMetrics() {
+	select {
+	case <-o.stopSendingMetrics:
+		return
+	default:
+	}
+
+	if o.referenceID == "" {
+		// TODO: should it warn?
+		return
+	}
+
+	samplesContainers := o.GetBufferedSamples()
+	if len(samplesContainers) < 1 {
+		return
+	}
+
+	start := time.Now()
+	o.collectSamples(samplesContainers)
+
+	// TODO: in case an aggregation period will be added then
+	// it continue only if the aggregation time frame passed
+
+	metricSet := make([]*pbcloud.Metric, 0, len(o.activeSeries))
+	for m, aggr := range o.activeSeries {
+		if len(aggr.Samples) < 1 {
+			// If a bucket (a metric) has been added
+			// then the assumption is to collect at least once in a flush interval.
+			continue
+		}
+		metricSet = append(metricSet, o.mapMetricProto(m, aggr))
+		aggr.Clean()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), o.config.MetricPushInterval.TimeDuration())
+	defer cancel()
+	err := o.metricsClient.Push(ctx, o.referenceID, &pbcloud.MetricSet{Metrics: metricSet})
+	if err != nil {
+		o.logger.WithError(err).Error("Failed to push metrics to the cloud")
+
+		if o.shouldStopSendingMetrics(err) {
+			o.logger.WithError(err).Warn("Interrupt sending metrics to cloud due to an error")
+			serr := errext.WithAbortReasonIfNone(
+				errext.WithExitCodeIfNone(err, exitcodes.ExternalAbort),
+				errext.AbortedByOutput,
+			)
+			if o.config.StopOnError.Bool {
+				o.testStopFunc(serr)
+			}
+			close(o.stopSendingMetrics)
+		}
+		return
+	}
+
+	o.logger.WithField("t", time.Since(start)).Debug("Successfully flushed buffered samples to the cloud")
+}
+
+// collectSamples drain the buffer and collect all the samples
+func (o *Output) collectSamples(containers []metrics.SampleContainer) {
+	var (
+		aggr aggregatedSamples
+		ok   bool
+	)
+	for _, sampleContainer := range containers {
+		samples := sampleContainer.GetSamples()
+		for i := 0; i < len(samples); i++ {
+			aggr, ok = o.activeSeries[samples[i].Metric]
+			if !ok {
+				aggr = aggregatedSamples{
+					Samples: make(map[metrics.TimeSeries][]*metrics.Sample),
+				}
+				o.activeSeries[samples[i].Metric] = aggr
+			}
+			aggr.AddSample(&samples[i])
+		}
+	}
+}
+
+func (o *Output) mapMetricProto(m *metrics.Metric, as aggregatedSamples) *pbcloud.Metric {
+	var mtype pbcloud.MetricType
+	switch m.Type {
+	case metrics.Counter:
+		mtype = pbcloud.MetricType_METRIC_TYPE_COUNTER
+	case metrics.Gauge:
+		mtype = pbcloud.MetricType_METRIC_TYPE_GAUGE
+	case metrics.Rate:
+		mtype = pbcloud.MetricType_METRIC_TYPE_RATE
+	case metrics.Trend:
+		mtype = pbcloud.MetricType_METRIC_TYPE_TREND
+	}
+
+	// TODO: based on the fact that this mapping is a pointer
+	// and it is escaped on the heap evaluate if it makes
+	// sense to allocate just once reusing a cached version
+	return &pbcloud.Metric{
+		Name:       m.Name,
+		Type:       mtype,
+		TimeSeries: as.MapAsProto(o.referenceID),
+	}
+}
+
+type aggregatedSamples struct {
+	Samples map[metrics.TimeSeries][]*metrics.Sample
+}
+
+func (as *aggregatedSamples) AddSample(s *metrics.Sample) {
+	tss, ok := as.Samples[s.TimeSeries]
+	if !ok {
+		// TODO: optimize the slice allocation
+		// A simple 1st step: Reuse the last seen len?
+		as.Samples[s.TimeSeries] = []*metrics.Sample{s}
+		return
+	}
+	as.Samples[s.TimeSeries] = append(tss, s)
+}
+
+func (as *aggregatedSamples) Clean() {
+	// TODO: evaluate if it makes sense
+	// to keep the most frequent used keys
+
+	// the compiler optimizes this
+	for k := range as.Samples {
+		delete(as.Samples, k)
+	}
+}
+
+func (as *aggregatedSamples) MapAsProto(refID string) []*pbcloud.TimeSeries {
+	if len(as.Samples) < 1 {
+		return nil
+	}
+	pbseries := make([]*pbcloud.TimeSeries, 0, len(as.Samples))
+	for ts, samples := range as.Samples {
+		pb := pbcloud.TimeSeries{}
+		// TODO: optimize removing Map
+		// and using https://github.com/grafana/k6/issues/2764
+		pb.Labels = make([]*pbcloud.Label, 0, ((*atlas.Node)(ts.Tags)).Len())
+		pb.Labels = append(pb.Labels, &pbcloud.Label{Name: "__name__", Value: ts.Metric.Name})
+		pb.Labels = append(pb.Labels, &pbcloud.Label{Name: "test_run_id", Value: refID})
+		for ktag, vtag := range ts.Tags.Map() {
+			pb.Labels = append(pb.Labels, &pbcloud.Label{Name: ktag, Value: vtag})
+		}
+
+		switch ts.Metric.Type {
+		case metrics.Counter:
+			counterSamples := &pbcloud.CounterSamples{}
+			for _, counterSample := range samples {
+				counterSamples.Values = append(counterSamples.Values, &pbcloud.CounterValue{
+					Time:  timestamppb.New(counterSample.Time),
+					Value: counterSample.Value,
+				})
+			}
+			pb.Samples = &pbcloud.TimeSeries_CounterSamples{
+				CounterSamples: counterSamples,
+			}
+		case metrics.Gauge:
+			gaugeSamples := &pbcloud.GaugeSamples{}
+			for _, gaugeSample := range samples {
+				gaugeSamples.Values = append(gaugeSamples.Values, &pbcloud.GaugeValue{
+					Time:  timestamppb.New(gaugeSample.Time),
+					Last:  gaugeSample.Value,
+					Min:   gaugeSample.Value,
+					Max:   gaugeSample.Value,
+					Avg:   gaugeSample.Value,
+					Count: 1,
+				})
+			}
+			pb.Samples = &pbcloud.TimeSeries_GaugeSamples{
+				GaugeSamples: gaugeSamples,
+			}
+		case metrics.Rate:
+			rateSamples := &pbcloud.RateSamples{}
+			for _, rateSample := range samples {
+				nonzero := uint32(0)
+				if rateSample.Value != 0 {
+					nonzero = 1
+				}
+				rateSamples.Values = append(rateSamples.Values, &pbcloud.RateValue{
+					Time:         timestamppb.New(rateSample.Time),
+					NonzeroCount: nonzero,
+					TotalCount:   1,
+				})
+			}
+			pb.Samples = &pbcloud.TimeSeries_RateSamples{
+				RateSamples: rateSamples,
+			}
+		case metrics.Trend:
+			trendSamples := &pbcloud.TrendHdrSamples{}
+			for _, trendSample := range samples {
+				hdrValue := histogramAsProto(
+					newHistogram([]float64{trendSample.Value}),
+					trendSample.Time,
+				)
+				trendSamples.Values = append(trendSamples.Values, hdrValue)
+			}
+
+			pb.Samples = &pbcloud.TimeSeries_TrendHdrSamples{
+				TrendHdrSamples: trendSamples,
+			}
+		}
+		pbseries = append(pbseries, &pb)
+	}
+	return pbseries
+}
