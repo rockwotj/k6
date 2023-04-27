@@ -26,7 +26,7 @@ import (
 )
 
 func BenchmarkAggregateHTTP(b *testing.B) {
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger:     testutils.NewLogger(b),
 		JSONConfig: json.RawMessage(`{"noCompress": true, "aggregationCalcInterval": "200ms","aggregationPeriod": "200ms"}`),
 		ScriptOptions: lib.Options{
@@ -291,7 +291,7 @@ func BenchmarkHTTPPush(b *testing.B) {
 		},
 	)
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger: testutils.NewLogger(b),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{
 "host": "%s",

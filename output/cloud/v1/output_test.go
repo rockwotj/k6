@@ -164,7 +164,7 @@ func runCloudOutputTestCase(t *testing.T, minSamples int) {
 
 	registry := metrics.NewRegistry()
 	builtinMetrics := metrics.RegisterBuiltinMetrics(registry)
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger:     testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{"host": "%s", "noCompress": true}`, tb.ServerHTTP.URL)),
 		ScriptOptions: lib.Options{
@@ -314,7 +314,7 @@ func TestCloudOutputMaxPerPacket(t *testing.T) {
 	}))
 	tb.Mux.HandleFunc("/v1/tests/12", func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger:     testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{"host": "%s", "noCompress": true}`, tb.ServerHTTP.URL)),
 		ScriptOptions: lib.Options{
@@ -418,7 +418,7 @@ func testCloudOutputStopSendingMetric(t *testing.T, stopOnError bool) {
 	}))
 	tb.Mux.HandleFunc("/v1/tests/12", func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger: testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{
 			"host": "%s", "noCompress": true,
@@ -531,7 +531,7 @@ func testCloudOutputStopSendingMetric(t *testing.T, stopOnError bool) {
 
 func TestCloudOutputRequireScriptName(t *testing.T) {
 	t.Parallel()
-	_, err := newOutput(output.Params{
+	_, err := New(output.Params{
 		Logger: testutils.NewLogger(t),
 		ScriptOptions: lib.Options{
 			Duration:   types.NullDurationFrom(1 * time.Second),
@@ -560,7 +560,7 @@ func TestCloudOutputAggregationPeriodZeroNoBlock(t *testing.T) {
 	}))
 	tb.Mux.HandleFunc("/v1/tests/123", func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger: testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{
 			"host": "%s", "noCompress": true,
@@ -615,7 +615,7 @@ func TestCloudOutputPushRefID(t *testing.T) {
 	tb.Mux.HandleFunc("/v1/tests/333", failHandler)
 	tb.Mux.HandleFunc("/v1/metrics/333", getSampleChecker(t, expSamples))
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger: testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{
 			"host": "%s", "noCompress": true,
@@ -686,7 +686,7 @@ func TestCloudOutputRecvIterLIAllIterations(t *testing.T) {
 	}))
 	tb.Mux.HandleFunc("/v1/tests/123", func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger: testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{
 			"host": "%s", "noCompress": true,
@@ -807,7 +807,7 @@ func TestNewName(t *testing.T) {
 		testCase := testCase
 
 		t.Run(testCase.url.String(), func(t *testing.T) {
-			out, err := newOutput(output.Params{
+			out, err := New(output.Params{
 				Logger: testutils.NewLogger(t),
 				ScriptOptions: lib.Options{
 					Duration:   types.NullDurationFrom(1 * time.Second),
@@ -845,7 +845,7 @@ func TestPublishMetric(t *testing.T) {
 	}))
 	defer server.Close()
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger:     testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{"host": "%s", "noCompress": false}`, server.URL)),
 		ScriptOptions: lib.Options{
@@ -879,7 +879,7 @@ func TestNewOutputClientTimeout(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	out, err := newOutput(output.Params{
+	out, err := New(output.Params{
 		Logger:     testutils.NewLogger(t),
 		JSONConfig: json.RawMessage(fmt.Sprintf(`{"host": "%s",  "timeout": "2ms"}`, ts.URL)),
 		ScriptOptions: lib.Options{

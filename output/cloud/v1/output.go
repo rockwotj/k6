@@ -70,13 +70,8 @@ var _ interface {
 	output.WithTestRunStop
 } = &Output{}
 
-// New creates a new cloud output.
-func New(params output.Params) (output.Output, error) {
-	return newOutput(params)
-}
-
-// New creates a new cloud output.
-func newOutput(params output.Params) (*Output, error) {
+// New creates a new Cloud output version 1.
+func New(params output.Params) (*Output, error) {
 	conf, err := cloudapi.GetConsolidatedConfig(
 		params.JSONConfig, params.Environment, params.ConfigArgument, params.ScriptOptions.External)
 	if err != nil {
