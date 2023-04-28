@@ -10,7 +10,7 @@ import (
 	"go.k6.io/k6/loader"
 )
 
-// FileLoader is a type alias for a function that returns new the contents of the referenced file
+// FileLoader is a type alias for a function that returns the contents of the referenced file.
 type FileLoader func(specifier *url.URL, name string) ([]byte, error)
 
 type module interface {
@@ -159,8 +159,7 @@ func (ms *ModuleSystem) Require(pwd *url.URL, arg string) (*goja.Object, error) 
 func (ms *ModuleSystem) RunSourceData(source *loader.SourceData) (goja.Value, error) {
 	specifier := source.URL.String()
 	pwd := source.URL.ResolveReference(&url.URL{Path: "../"}) // TODO: fix
-	_, err := ms.resolver.resolveLoaded(pwd, specifier, source.Data)
-	if err != nil {
+	if _, err := ms.resolver.resolveLoaded(pwd, specifier, source.Data); err != nil {
 		return nil, err // TODO wrap as this should never happen
 	}
 	return ms.Require(pwd, specifier)

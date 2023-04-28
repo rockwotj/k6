@@ -63,7 +63,7 @@ func (c *cjsModuleInstance) exports() *goja.Object {
 // It is mostly a wrapper around compiler.Compiler@Compile
 //
 // TODO: extract this to not make this package dependant on compilers.
-// this is potentially mute point after ESM when the compiler will likely get mostly dropped.
+// this is potentially a moot point after ESM when the compiler will likely get mostly dropped.
 func cjsModuleFromString(fileURL *url.URL, data []byte, c *compiler.Compiler) (*cjsModule, error) {
 	pgm, _, err := c.Compile(string(data), fileURL.String(), false)
 	if err != nil {

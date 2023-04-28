@@ -59,8 +59,8 @@ func (r *Runtime) MoveToVUContext(state *lib.State) {
 	r.VU.StateField = state
 }
 
-// SetupModuleSystem setups the modules system for the current Runtime
-// see [modules.NewModuleResolver] for the meaining of the parameters
+// SetupModuleSystem sets up the modules system for the current Runtime.
+// See [modules.NewModuleResolver] for the meaning of the parameters.
 func (r *Runtime) SetupModuleSystem(
 	goModules map[string]interface{}, loader modules.FileLoader, c *compiler.Compiler,
 ) error {
