@@ -15,8 +15,10 @@ import (
 	"go.k6.io/k6/lib/consts"
 	"go.k6.io/k6/metrics"
 	"go.k6.io/k6/output"
-	cloudv1 "go.k6.io/k6/output/cloud/v1"
 	"gopkg.in/guregu/null.v3"
+
+	cloudv2 "go.k6.io/k6/output/cloud/expv2"
+	cloudv1 "go.k6.io/k6/output/cloud/v1"
 )
 
 // TestName is the default k6 Cloud test name
@@ -44,7 +46,7 @@ type apiVersion int64
 const (
 	apiVersionUndefined apiVersion = iota
 	apiVersion1
-	// apiVersion2 // TODO: add version 2
+	apiVersion2
 )
 
 // Output sends result data to the k6 Cloud service.
@@ -334,6 +336,8 @@ func (out *Output) startVersionedOutput() error {
 	switch out.config.APIVersion.Int64 {
 	case int64(apiVersion1):
 		out.versionedOutput, err = cloudv1.New(out.logger, out.config, out.client)
+	case int64(apiVersion2):
+		out.versionedOutput, err = cloudv2.New(out.logger, out.config)
 	default:
 		err = fmt.Errorf("v%d is an unexpected version", out.config.APIVersion.Int64)
 	}
