@@ -2,6 +2,7 @@ package expv2
 
 import (
 	"math"
+	"math/bits"
 	"time"
 
 	"go.k6.io/k6/output/cloud/expv2/pbcloud"
@@ -193,8 +194,7 @@ func resolveBucketIndex(val float64) uint32 {
 		return 0
 	}
 
-	upscaled := int32(math.Ceil(val))
-	bucketIdx := upscaled
+	upscaled := uint32(math.Ceil(val))
 
 	// k is a power of 2 closest to 10^precision_points
 	// At the moment the precision_points is a fixed value set to 2.
@@ -203,24 +203,25 @@ func resolveBucketIndex(val float64) uint32 {
 	//     2^10 = 1024 ~ 1000 = 10^3
 	// f(x) = 3*x + 1 - empiric formula that works for us
 	// since f(2)=7 and f(3)=10
-	const k = 7
+	const k = uint32(7)
 
 	// 256 = 1 << (k+1)
-	if upscaled >= 256 {
-		//
-		// Here we use some math to get simple formula
-		// derivation:
-		// let n = msb(u) - most significant digit position
-		// i.e. n = floor(log(u, 2))
-		//   major_bucket_index = n - k + 1
-		//   sub_bucket_index = u>>(n - k) - (1<<k)
-		//   bucket = major_bucket_index << k + sub_bucket_index =
-		//          = (n-k+1)<<k + u>>(n-k) - (1<<k) =
-		//          = (n-k)<<k + u>>(n-k)
-		//
-		nkdiff := int32(math.Floor(math.Log2(float64(upscaled >> k))))
-		bucketIdx = (nkdiff << k) + (upscaled >> nkdiff)
+	if upscaled < 256 {
+		return upscaled
 	}
 
-	return uint32(bucketIdx)
+	//
+	// Here we use some math to get simple formula
+	// derivation:
+	// let u = upscaled
+	// let n = msb(u) - most significant digit position
+	// i.e. n = floor(log(u, 2))
+	//   major_bucket_index = n - k + 1
+	//   sub_bucket_index = u>>(n - k) - (1<<k)
+	//   bucket = major_bucket_index << k + sub_bucket_index =
+	//          = (n-k+1)<<k + u>>(n-k) - (1<<k) =
+	//          = (n-k)<<k + u>>(n-k)
+	//
+	nkdiff := uint32(bits.Len32(upscaled>>7) - 1) // msb index
+	return (nkdiff << k) + (upscaled >> nkdiff)
 }

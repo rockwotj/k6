@@ -31,10 +31,9 @@ func TestValueBacket(t *testing.T) {
 		{in: (1 << 30) - 1, exp: 3071},
 		{in: (1 << 30), exp: 3072},
 		{in: math.MaxInt32, exp: 3199},
-		{in: math.MaxInt32 + 1, exp: 2147483648}, // int32 overflow
 	}
 	for _, tc := range tests {
-		assert.Equal(t, int(tc.exp), int(resolveBucketIndex(tc.in)), tc.in)
+		assert.Equal(t, tc.exp, resolveBucketIndex(tc.in), tc.in)
 	}
 }
 
