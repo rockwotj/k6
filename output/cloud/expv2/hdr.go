@@ -138,12 +138,31 @@ func (h *histogram) addToBucket(v float64) {
 	}
 
 	if index >= blen {
-		// TODO: evaluate if a pool can improve
-
-		// expand with zeros up to the required index
-		h.Buckets = append(h.Buckets, make([]uint32, index-blen+1)...)
+		h.grow(index)
 	}
 	h.Buckets[index]++
+}
+
+// grow expands the buckets slice
+// with zeros up to the required index
+func (h *histogram) grow(index uint32) {
+	i := int(index)
+	if len(h.Buckets)-1 > i {
+		panic("buckets is already bigger than requested index")
+	}
+	if cap(h.Buckets) > i {
+		// See https://go.dev/ref/spec#Slice_expressions
+		// "For slices, the upper index bound is
+		// the slice capacity cap(a) rather than the length"
+		h.Buckets = h.Buckets[:index+1]
+	} else {
+		length := i + 1
+		// let's make two times larger of
+		// the current request
+		newBuckets := make([]uint32, length, (len(h.Buckets)+length)*2)
+		copy(newBuckets, h.Buckets)
+		h.Buckets = newBuckets
+	}
 }
 
 // trimzeros removes all buckets that have a zero value
