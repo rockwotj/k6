@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"go.k6.io/k6/metrics"
-	"go.k6.io/k6/output"
 )
 
 type bucketQ struct {
@@ -41,27 +40,13 @@ type timeBucket struct {
 	Sink       metrics.Sink
 }
 
-type perSeriesBuckets map[metrics.TimeSeries]timeBucket
+type perSeriesBucket map[metrics.TimeSeries]timeBucket
 
-func newPerSeriesBuckets() perSeriesBuckets {
+func newPerSeriesBucket() perSeriesBucket {
 	return make(map[metrics.TimeSeries]timeBucket)
 }
 
-func (m perSeriesBuckets) AddSample(bucketID int64, s metrics.Sample, aggrPeriod int64) {
-	b, ok := m[s.TimeSeries]
-	if !ok {
-		b = timeBucket{
-			Time:       time.Unix(0, (bucketID*aggrPeriod)+(aggrPeriod/2)).Truncate(time.Microsecond),
-			TimeSeries: s.TimeSeries,
-			Sink:       newSink(s.Metric.Type),
-		}
-		m[s.TimeSeries] = b
-	}
-	b.Sink.Add(s)
-}
-
 type collector struct {
-	buf   *output.SampleBuffer
 	bq    bucketQ
 	nowfn func() time.Time
 
@@ -73,26 +58,32 @@ type collector struct {
 	// aggregation buckets. This should save us a some time, since it would make the lookups and WaitPeriod
 	// checks basically O(1). And even if for some reason there are occasional metrics with past times that
 	// don't fit in the chosen ring buffer size, we could just send them along to the buffer unaggregated
-	aggrBuckets map[int64]perSeriesBuckets
+	timeBuckets map[int64]perSeriesBucket
 }
 
-func newCollector(buf *output.SampleBuffer, aggrPeriod, waitPeriod time.Duration) (*collector, error) {
+func newCollector(aggrPeriod, waitPeriod time.Duration) (*collector, error) {
 	if aggrPeriod == 0 {
 		return nil, errors.New("aggregation period is not allowed to be zero")
 	}
 	return &collector{
-		buf:               buf,
 		bq:                bucketQ{},
 		nowfn:             time.Now,
-		aggrBuckets:       make(map[int64]perSeriesBuckets),
+		timeBuckets:       make(map[int64]perSeriesBucket),
 		aggregationPeriod: aggrPeriod,
 		waitPeriod:        waitPeriod,
 	}, nil
 }
 
 // CollectSamples drain the buffer and collect all the samples.
-func (c *collector) CollectSamples() {
-	c.bucketing(c.buf.GetBufferedSamples())
+func (c *collector) CollectSamples(containers []metrics.SampleContainer) {
+	// Distribute all newly buffered samples into related buckets
+	for _, sampleContainer := range containers {
+		samples := sampleContainer.GetSamples()
+
+		for i := 0; i < len(samples); i++ {
+			c.collectSample(samples[i])
+		}
+	}
 
 	expired := c.expiredBuckets()
 	if len(expired) > 0 {
@@ -100,43 +91,38 @@ func (c *collector) CollectSamples() {
 	}
 }
 
-func (c *collector) bucketID(t time.Time) int64 {
-	return t.UnixNano() / int64(c.aggregationPeriod)
-}
+func (c *collector) collectSample(s metrics.Sample) {
+	bucketID := c.bucketID(s.Time)
 
-func (c *collector) bucketing(containers []metrics.SampleContainer) {
-	// Distribute all newly buffered samples into related buckets
-	for _, sampleContainer := range containers {
-		samples := sampleContainer.GetSamples()
-
-		for i := 0; i < len(samples); i++ {
-			bucketID := c.bucketID(samples[i].Time)
-
-			// Get or create a time bucket
-			buckets, ok := c.aggrBuckets[bucketID]
-			if !ok {
-				buckets = newPerSeriesBuckets()
-				c.aggrBuckets[bucketID] = buckets
-			}
-
-			buckets.AddSample(bucketID, samples[i], int64(c.aggregationPeriod))
-		}
+	// Get or create a time bucket
+	bucket, ok := c.timeBuckets[bucketID]
+	if !ok {
+		bucket = newPerSeriesBucket()
+		c.timeBuckets[bucketID] = bucket
 	}
+
+	sink, ok := bucket[s.TimeSeries]
+	if !ok {
+		sink = timeBucket{
+			Time:       time.Unix(0, (bucketID*int64(c.aggregationPeriod))+int64(c.aggregationPeriod/2)).Truncate(time.Microsecond),
+			TimeSeries: s.TimeSeries,
+			Sink:       newSink(s.Metric.Type),
+		}
+		bucket[s.TimeSeries] = sink
+	}
+	sink.Sink.Add(s)
 }
 
 func (c *collector) expiredBuckets() []timeBucket {
 	// Still new buckets where we have to wait to accumulate
 	// more samples before flushing
-	//
-	// TODO: Do we need it?
-	// if the Cloud handles the merge is not really required
-	bucketCutoffID := c.nowfn().Add(-c.waitPeriod).UnixNano() / int64(c.aggregationPeriod)
+	bucketCutoffID := c.bucketCutoffID()
 
 	// TODO: multiply it at least for the number of metrics?
-	expired := make([]timeBucket, 0, len(c.aggrBuckets))
+	expired := make([]timeBucket, 0, len(c.timeBuckets))
 
 	// Handle all aggregation buckets older than bucketCutoffID
-	for bucketID, seriesBuckets := range c.aggrBuckets {
+	for bucketID, seriesBuckets := range c.timeBuckets {
 		if bucketID > bucketCutoffID {
 			continue
 		}
@@ -148,11 +134,19 @@ func (c *collector) expiredBuckets() []timeBucket {
 
 			expired = append(expired, bucket)
 		}
-		delete(c.aggrBuckets, bucketID)
+		delete(c.timeBuckets, bucketID)
 	}
 
 	if len(expired) < 1 {
 		return nil
 	}
 	return expired
+}
+
+func (c *collector) bucketID(t time.Time) int64 {
+	return t.UnixNano() / int64(c.aggregationPeriod)
+}
+
+func (c *collector) bucketCutoffID() int64 {
+	return c.nowfn().Add(-c.waitPeriod).UnixNano() / int64(c.aggregationPeriod)
 }

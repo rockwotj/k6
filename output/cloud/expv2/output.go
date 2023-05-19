@@ -61,7 +61,6 @@ func (o *Output) Start() error {
 
 	var err error
 	o.collector, err = newCollector(
-		&o.SampleBuffer,
 		o.config.AggregationPeriod.TimeDuration(),
 		o.config.AggregationWaitPeriod.TimeDuration())
 	if err != nil {
@@ -72,15 +71,15 @@ func (o *Output) Start() error {
 		bq:          &o.collector.bq,
 	}
 
-	timeframe := o.config.MetricPushInterval.TimeDuration()
-	pf, err := output.NewPeriodicFlusher(timeframe, o.flushMetrics)
+	pf, err := output.NewPeriodicFlusher(
+		o.config.MetricPushInterval.TimeDuration(), o.flushMetrics)
 	if err != nil {
 		return err
 	}
 	o.periodicFlusher = pf
 
-	timeframe = o.config.AggregationPeriod.TimeDuration()
-	pfc, err := output.NewPeriodicFlusher(timeframe, o.collector.CollectSamples)
+	pfc, err := output.NewPeriodicFlusher(
+		o.config.AggregationPeriod.TimeDuration(), o.collectSamples)
 	if err != nil {
 		return err
 	}
@@ -103,13 +102,36 @@ func (o *Output) StopWithTestError(testErr error) error {
 
 // AddMetricSamples receives the samples streaming.
 func (o *Output) AddMetricSamples(s []metrics.SampleContainer) {
+	// TODO: this and the next operation are two locking operations,
+	// evaluate to do something smarter.
 	select {
 	case <-o.stopSendingMetrics:
 		return
 	default:
 	}
 
+	// TODO: when we will have a very good optimized
+	// bucketing process we may evaluate to drop this
+	// buffer.
+	//
+	// If the bucketing process is efficient, the single
+	// operation could be a bit longer than just enqueuing
+	// but it could be fast enough to justify to to direct
+	// run it and save some memory across the e2e operation.
+	//
+	// It requires very specific benchmark.
 	o.SampleBuffer.AddMetricSamples(s)
+}
+
+func (o *Output) collectSamples() {
+	samples := o.GetBufferedSamples()
+	if len(samples) < 1 {
+		return
+	}
+	o.collector.CollectSamples(samples)
+
+	// TODO: other operations with the samples containers
+	// e.g. flushing the Metadata as tracing samples
 }
 
 // flushMetrics receives a set of metric samples.
@@ -133,12 +155,6 @@ func (o *Output) flushMetrics() {
 				o.testStopFunc(serr)
 			}
 			close(o.stopSendingMetrics)
-
-			// TODO: just stop the entire output?
-			// otherwise the collector continue the
-			// buffering and it could generate an OOM
-			//
-			// o.Stop()
 		}
 		return
 	}

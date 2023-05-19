@@ -80,10 +80,10 @@ func TestCollectorBucketing(t *testing.T) {
 	}
 	c := collector{
 		aggregationPeriod: 3 * time.Second,
-		aggrBuckets:       make(map[int64]perSeriesBuckets),
+		timeBuckets:       make(map[int64]perSeriesBuckets),
 	}
 	c.bucketing([]metrics.SampleContainer{samples})
-	assert.Len(t, c.aggrBuckets, 3)
+	assert.Len(t, c.timeBuckets, 3)
 }
 
 func TestCollectorExpiredBuckets(t *testing.T) {
@@ -104,7 +104,7 @@ func TestCollectorExpiredBuckets(t *testing.T) {
 		nowfn: func() time.Time {
 			return time.Unix(10, 0)
 		},
-		aggrBuckets: map[int64]perSeriesBuckets{
+		timeBuckets: map[int64]perSeriesBuckets{
 			3: map[metrics.TimeSeries]timeBucket{
 				ts: {Time: time.Unix(1, 0)},
 			},
@@ -118,8 +118,8 @@ func TestCollectorExpiredBuckets(t *testing.T) {
 	}
 	expired := c.expiredBuckets()
 	require.Len(t, expired, 1)
-	assert.Len(t, c.aggrBuckets, 2)
-	assert.NotContains(t, c.aggrBuckets, 3)
+	assert.Len(t, c.timeBuckets, 2)
+	assert.NotContains(t, c.timeBuckets, 3)
 
 	assert.Equal(t, time.Unix(1, 0), expired[0].Time)
 }
