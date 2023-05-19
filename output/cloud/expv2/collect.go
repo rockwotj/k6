@@ -8,42 +8,35 @@ import (
 	"go.k6.io/k6/metrics"
 )
 
+type timeBucket struct {
+	Time  time.Time
+	Sinks map[metrics.TimeSeries]metrics.Sink
+}
+
+// bucketQ is a queue for buffering
+// the aggregated metrics that have to be flushed.
 type bucketQ struct {
 	m       sync.Mutex
 	buckets []timeBucket
 }
 
-// Buckets pop all the queued buckets.
-func (q *bucketQ) Buckets() []timeBucket {
+func (q *bucketQ) PopAll() []timeBucket {
 	q.m.Lock()
 	defer q.m.Unlock()
 
 	if len(q.buckets) < 1 {
 		return nil
 	}
-	b := make([]timeBucket, len(q.buckets))
-	copy(b, q.buckets)
-	q.buckets = q.buckets[:0]
+
+	b := q.buckets
+	q.buckets = make([]timeBucket, 0, len(b))
 	return b
 }
 
-// Insert adds an item in the queue.
 func (q *bucketQ) Push(b []timeBucket) {
 	q.m.Lock()
 	q.buckets = append(q.buckets, b...)
 	q.m.Unlock()
-}
-
-type timeBucket struct {
-	TimeSeries metrics.TimeSeries
-	Time       time.Time
-	Sink       metrics.Sink
-}
-
-type perSeriesBucket map[metrics.TimeSeries]timeBucket
-
-func newPerSeriesBucket() perSeriesBucket {
-	return make(map[metrics.TimeSeries]timeBucket)
 }
 
 type collector struct {
@@ -58,7 +51,7 @@ type collector struct {
 	// aggregation buckets. This should save us a some time, since it would make the lookups and WaitPeriod
 	// checks basically O(1). And even if for some reason there are occasional metrics with past times that
 	// don't fit in the chosen ring buffer size, we could just send them along to the buffer unaggregated
-	timeBuckets map[int64]perSeriesBucket
+	timeBuckets map[int64]map[metrics.TimeSeries]metrics.Sink
 }
 
 func newCollector(aggrPeriod, waitPeriod time.Duration) (*collector, error) {
@@ -68,7 +61,7 @@ func newCollector(aggrPeriod, waitPeriod time.Duration) (*collector, error) {
 	return &collector{
 		bq:                bucketQ{},
 		nowfn:             time.Now,
-		timeBuckets:       make(map[int64]perSeriesBucket),
+		timeBuckets:       make(map[int64]map[metrics.TimeSeries]metrics.Sink),
 		aggregationPeriod: aggrPeriod,
 		waitPeriod:        waitPeriod,
 	}, nil
@@ -86,9 +79,10 @@ func (c *collector) CollectSamples(containers []metrics.SampleContainer) {
 	}
 
 	expired := c.expiredBuckets()
-	if len(expired) > 0 {
-		c.bq.Push(expired)
+	if len(expired) < 1 {
+		return
 	}
+	c.bq.Push(expired)
 }
 
 func (c *collector) collectSample(s metrics.Sample) {
@@ -97,43 +91,42 @@ func (c *collector) collectSample(s metrics.Sample) {
 	// Get or create a time bucket
 	bucket, ok := c.timeBuckets[bucketID]
 	if !ok {
-		bucket = newPerSeriesBucket()
+		bucket = make(map[metrics.TimeSeries]metrics.Sink)
 		c.timeBuckets[bucketID] = bucket
 	}
 
+	// Get or create the bucket's sinks map per time series
 	sink, ok := bucket[s.TimeSeries]
 	if !ok {
-		sink = timeBucket{
-			Time:       time.Unix(0, (bucketID*int64(c.aggregationPeriod))+int64(c.aggregationPeriod/2)).Truncate(time.Microsecond),
-			TimeSeries: s.TimeSeries,
-			Sink:       newSink(s.Metric.Type),
-		}
+		sink = newSink(s.Metric.Type)
 		bucket[s.TimeSeries] = sink
 	}
-	sink.Sink.Add(s)
+
+	// TODO: we may consider to just pass
+	// the single value instead of the entire
+	// sample and save some memory
+	sink.Add(s)
 }
 
 func (c *collector) expiredBuckets() []timeBucket {
-	// Still new buckets where we have to wait to accumulate
-	// more samples before flushing
+	// Still too recent buckets
+	// where we prefer to wait a bit more
+	// then, hopefully, we can aggregate more samples before flushing.
 	bucketCutoffID := c.bucketCutoffID()
 
-	// TODO: multiply it at least for the number of metrics?
-	expired := make([]timeBucket, 0, len(c.timeBuckets))
+	// Here, it avoids pre-allocation
+	// because it expects to be zero for most of the time
+	var expired []timeBucket //nolint:prealloc
 
-	// Handle all aggregation buckets older than bucketCutoffID
-	for bucketID, seriesBuckets := range c.timeBuckets {
+	// Mark as expired all aggregation buckets older than bucketCutoffID
+	for bucketID, seriesSinks := range c.timeBuckets {
 		if bucketID > bucketCutoffID {
 			continue
 		}
-
-		for _, bucket := range seriesBuckets {
-			// TODO: is there a valid math reason to have a minimum
-			// number of samples aggregated as we do in v1?
-			// I mean o.config.AggregationMinSamples.Int64
-
-			expired = append(expired, bucket)
-		}
+		expired = append(expired, timeBucket{
+			Time:  c.timeFromBucketID(bucketID),
+			Sinks: seriesSinks,
+		})
 		delete(c.timeBuckets, bucketID)
 	}
 
@@ -145,6 +138,13 @@ func (c *collector) expiredBuckets() []timeBucket {
 
 func (c *collector) bucketID(t time.Time) int64 {
 	return t.UnixNano() / int64(c.aggregationPeriod)
+}
+
+func (c *collector) timeFromBucketID(id int64) time.Time {
+	return time.Unix(0,
+		// it uses the center of the bucket as time
+		(id*int64(c.aggregationPeriod))+int64(c.aggregationPeriod/2),
+	).Truncate(time.Microsecond).UTC()
 }
 
 func (c *collector) bucketCutoffID() int64 {

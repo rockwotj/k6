@@ -103,7 +103,8 @@ func (o *Output) StopWithTestError(testErr error) error {
 // AddMetricSamples receives the samples streaming.
 func (o *Output) AddMetricSamples(s []metrics.SampleContainer) {
 	// TODO: this and the next operation are two locking operations,
-	// evaluate to do something smarter.
+	// evaluate to do something smarter, maybe having a lock-free
+	// queue.
 	select {
 	case <-o.stopSendingMetrics:
 		return

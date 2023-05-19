@@ -11,6 +11,6 @@ type noopFlusher struct {
 
 func (f *noopFlusher) Flush(ctx context.Context) error {
 	// drain the buffer
-	_ = f.bq.Buckets()
+	_ = f.bq.PopAll()
 	return nil
 }

@@ -66,11 +66,11 @@ func TestOutputCollectSamples(t *testing.T) {
 	o.periodicFlusher.Stop()
 
 	o.periodicCollector.Stop()
-	require.Empty(t, o.collector.bq.Buckets())
+	require.Empty(t, o.collector.bq.PopAll())
 
 	o.collector.nowfn = func() time.Time {
 		// the cut off will be set to (22-1)
-		return time.Date(2023, time.May, 1, 1, 1, 20, 0, time.Local)
+		return time.Date(2023, time.May, 1, 1, 1, 20, 0, time.UTC)
 	}
 
 	r := metrics.NewRegistry()
@@ -82,37 +82,35 @@ func TestOutputCollectSamples(t *testing.T) {
 
 	s1 := metrics.Sample{
 		TimeSeries: ts,
-		Time:       time.Date(2023, time.May, 1, 1, 1, 15, 0, time.Local),
+		Time:       time.Date(2023, time.May, 1, 1, 1, 15, 0, time.UTC),
 		Value:      1.0,
 	}
 
 	s2 := metrics.Sample{
 		TimeSeries: ts,
-		Time:       time.Date(2023, time.May, 1, 1, 1, 18, 0, time.Local),
+		Time:       time.Date(2023, time.May, 1, 1, 1, 18, 0, time.UTC),
 		Value:      2.0,
 	}
 
 	s3 := metrics.Sample{
 		TimeSeries: ts,
-		Time:       time.Date(2023, time.May, 1, 1, 1, 15, 0, time.Local),
+		Time:       time.Date(2023, time.May, 1, 1, 1, 15, 0, time.UTC),
 		Value:      4.0,
 	}
 
-	o.AddMetricSamples([]metrics.SampleContainer{
+	o.collector.CollectSamples([]metrics.SampleContainer{
 		metrics.Samples{s1},
 		metrics.Samples{s2},
 		metrics.Samples{s3},
 	})
-
-	o.collector.CollectSamples()
-	buckets := o.collector.bq.Buckets()
+	buckets := o.collector.bq.PopAll()
 	require.Len(t, buckets, 1)
-	assert.Equal(t, ts, buckets[0].TimeSeries)
+	require.Contains(t, buckets[0].Sinks, ts)
 
-	counter, ok := buckets[0].Sink.(*metrics.CounterSink)
+	counter, ok := buckets[0].Sinks[ts].(*metrics.CounterSink)
 	require.True(t, ok)
 	assert.Equal(t, 5.0, counter.Value)
 
-	expTime := time.Date(2023, time.May, 1, 1, 1, 16, int(500*time.Millisecond), time.Local)
+	expTime := time.Date(2023, time.May, 1, 1, 1, 16, int(500*time.Millisecond), time.UTC)
 	assert.Equal(t, expTime, buckets[0].Time)
 }
