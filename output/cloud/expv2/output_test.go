@@ -55,6 +55,8 @@ func TestOutputSetTestRunStopCallback(t *testing.T) {
 func TestOutputCollectSamples(t *testing.T) {
 	t.Parallel()
 	o, err := New(testutils.NewLogger(t), cloudapi.Config{
+		Host:                  null.StringFrom("flush-is-disabled"),
+		Token:                 null.StringFrom("a-fake-token"),
 		AggregationPeriod:     types.NewNullDuration(3*time.Second, true),
 		AggregationWaitPeriod: types.NewNullDuration(5*time.Second, true),
 		MetricPushInterval:    types.NewNullDuration(10*time.Second, true),

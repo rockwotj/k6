@@ -5,6 +5,7 @@ package expv2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -26,8 +27,7 @@ type Output struct {
 	referenceID  string
 	testStopFunc func(error)
 
-	// TODO: replace with the real impl
-	metricsFlusher  noopFlusher
+	flushing        *metricsFlushing
 	periodicFlusher *output.PeriodicFlusher
 
 	collector         *collector
@@ -71,24 +71,31 @@ func (o *Output) Start() error {
 		o.config.AggregationPeriod.TimeDuration(),
 		o.config.AggregationWaitPeriod.TimeDuration())
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize the samples collector: %w", err)
 	}
-	o.metricsFlusher = noopFlusher{
-		referenceID: o.referenceID,
-		bq:          &o.collector.bq,
+
+	mc, err := NewMetricsClient(o.logger, o.config.Host.String, o.config.Token.String)
+	if err != nil {
+		return fmt.Errorf("failed to initialize the http metrics flush client: %w", err)
+	}
+	o.flushing = &metricsFlushing{
+		referenceID:                o.referenceID,
+		bq:                         &o.collector.bq,
+		client:                     mc,
+		aggregationPeriodInSeconds: uint32(o.config.AggregationPeriod.TimeDuration().Seconds()),
 	}
 
 	pf, err := output.NewPeriodicFlusher(
 		o.config.MetricPushInterval.TimeDuration(), o.flushMetrics)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize the periodic flusher: %w", err)
 	}
 	o.periodicFlusher = pf
 
 	pfc, err := output.NewPeriodicFlusher(
 		o.config.AggregationPeriod.TimeDuration(), o.collectSamples)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to initialize the periodic collector: %w", err)
 	}
 	o.periodicCollector = pfc
 
@@ -150,7 +157,7 @@ func (o *Output) flushMetrics() {
 	ctx, cancel := context.WithTimeout(context.Background(), o.config.MetricPushInterval.TimeDuration())
 	defer cancel()
 
-	err := o.metricsFlusher.Flush(ctx)
+	err := o.flushing.Flush(ctx)
 	if err != nil {
 		o.handleFlushError(err)
 		return

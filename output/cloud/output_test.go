@@ -163,7 +163,9 @@ func TestOutputStartVersionedOutputV2(t *testing.T) {
 		referenceID: "123",
 		config: cloudapi.Config{
 			APIVersion: null.IntFrom(2),
-			// Here, we are enabling but silencing the related async ops
+			Host:       null.StringFrom("fake-cloud-url"),
+			Token:      null.StringFrom("fake-token"),
+			// Here, we are enabling it but silencing the related async ops
 			AggregationPeriod:  types.NullDurationFrom(1 * time.Hour),
 			MetricPushInterval: types.NullDurationFrom(1 * time.Hour),
 		},
