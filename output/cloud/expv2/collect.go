@@ -10,7 +10,7 @@ import (
 
 type timeBucket struct {
 	Time  time.Time
-	Sinks map[metrics.TimeSeries]metrics.Sink
+	Sinks map[metrics.TimeSeries]aggregatedMetric
 }
 
 // bucketQ is a queue for buffering
@@ -51,7 +51,7 @@ type collector struct {
 	// aggregation buckets. This should save us a some time, since it would make the lookups and WaitPeriod
 	// checks basically O(1). And even if for some reason there are occasional metrics with past times that
 	// don't fit in the chosen ring buffer size, we could just send them along to the buffer unaggregated
-	timeBuckets map[int64]map[metrics.TimeSeries]metrics.Sink
+	timeBuckets map[int64]map[metrics.TimeSeries]aggregatedMetric
 }
 
 func newCollector(aggrPeriod, waitPeriod time.Duration) (*collector, error) {
@@ -61,7 +61,7 @@ func newCollector(aggrPeriod, waitPeriod time.Duration) (*collector, error) {
 	return &collector{
 		bq:                bucketQ{},
 		nowfn:             time.Now,
-		timeBuckets:       make(map[int64]map[metrics.TimeSeries]metrics.Sink),
+		timeBuckets:       make(map[int64]map[metrics.TimeSeries]aggregatedMetric),
 		aggregationPeriod: aggrPeriod,
 		waitPeriod:        waitPeriod,
 	}, nil
@@ -91,21 +91,18 @@ func (c *collector) collectSample(s metrics.Sample) {
 	// Get or create a time bucket
 	bucket, ok := c.timeBuckets[bucketID]
 	if !ok {
-		bucket = make(map[metrics.TimeSeries]metrics.Sink)
+		bucket = make(map[metrics.TimeSeries]aggregatedMetric)
 		c.timeBuckets[bucketID] = bucket
 	}
 
 	// Get or create the bucket's sinks map per time series
 	sink, ok := bucket[s.TimeSeries]
 	if !ok {
-		sink = newSink(s.Metric.Type)
+		sink = newAggregatedMetric(s.Metric.Type)
 		bucket[s.TimeSeries] = sink
 	}
 
-	// TODO: we may consider to just pass
-	// the single value instead of the entire
-	// sample and save some memory
-	sink.Add(s)
+	sink.Add(s.Value)
 }
 
 func (c *collector) expiredBuckets() []timeBucket {

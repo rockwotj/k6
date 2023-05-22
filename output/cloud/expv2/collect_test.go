@@ -95,7 +95,7 @@ func TestCollectorExpiredBucketsNoExipired(t *testing.T) {
 		nowfn: func() time.Time {
 			return time.Unix(10, 0)
 		},
-		timeBuckets: map[int64]map[metrics.TimeSeries]metrics.Sink{
+		timeBuckets: map[int64]map[metrics.TimeSeries]aggregatedMetric{
 			6: {},
 		},
 	}
@@ -124,10 +124,10 @@ func TestCollectorExpiredBuckets(t *testing.T) {
 		nowfn: func() time.Time {
 			return time.Unix(10, 0)
 		},
-		timeBuckets: map[int64]map[metrics.TimeSeries]metrics.Sink{
+		timeBuckets: map[int64]map[metrics.TimeSeries]aggregatedMetric{
 			3: {
-				ts1: &metrics.CounterSink{Value: 10},
-				ts2: &metrics.CounterSink{Value: 4},
+				ts1: &counter{Sum: 10},
+				ts2: &counter{Sum: 4},
 			},
 		},
 	}
@@ -135,10 +135,12 @@ func TestCollectorExpiredBuckets(t *testing.T) {
 	require.Len(t, expired, 1)
 
 	assert.NotZero(t, expired[0].Time)
-	assert.Equal(t, expired[0].Sinks, map[metrics.TimeSeries]metrics.Sink{
-		ts1: &metrics.CounterSink{Value: 10},
-		ts2: &metrics.CounterSink{Value: 4},
-	})
+
+	exp := map[metrics.TimeSeries]aggregatedMetric{
+		ts1: &counter{Sum: 10},
+		ts2: &counter{Sum: 4},
+	}
+	assert.Equal(t, exp, expired[0].Sinks)
 }
 
 func TestCollectorExpiredBucketsCutoff(t *testing.T) {
@@ -150,7 +152,7 @@ func TestCollectorExpiredBucketsCutoff(t *testing.T) {
 		nowfn: func() time.Time {
 			return time.Unix(10, 0)
 		},
-		timeBuckets: map[int64]map[metrics.TimeSeries]metrics.Sink{
+		timeBuckets: map[int64]map[metrics.TimeSeries]aggregatedMetric{
 			3: {},
 			6: {},
 			9: {},
@@ -239,9 +241,9 @@ func TestBucketQPopAll(t *testing.T) {
 func TestBucketQPushPopConcurrency(t *testing.T) {
 	t.Parallel()
 	var (
-		counter = 0
-		bq      = bucketQ{}
-		sink    = metrics.NewSink(metrics.Counter)
+		count = 0
+		bq    = bucketQ{}
+		sink  = &counter{}
 
 		stop = time.After(100 * time.Millisecond)
 		pop  = make(chan struct{}, 10)
@@ -268,17 +270,17 @@ func TestBucketQPushPopConcurrency(t *testing.T) {
 			close(done)
 			return
 		default:
-			counter++
+			count++
 			bq.Push([]timeBucket{
 				{
 					Time: now,
-					Sinks: map[metrics.TimeSeries]metrics.Sink{
+					Sinks: map[metrics.TimeSeries]aggregatedMetric{
 						{}: sink,
 					},
 				},
 			})
 
-			if counter%5 == 0 { // a fixed-arbitrary flush rate
+			if count%5 == 0 { // a fixed-arbitrary flush rate
 				pop <- struct{}{}
 			}
 		}

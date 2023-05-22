@@ -110,9 +110,9 @@ func TestOutputCollectSamples(t *testing.T) {
 	require.Len(t, buckets, 1)
 	require.Contains(t, buckets[0].Sinks, ts)
 
-	counter, ok := buckets[0].Sinks[ts].(*metrics.CounterSink)
+	counter, ok := buckets[0].Sinks[ts].(*counter)
 	require.True(t, ok)
-	assert.Equal(t, 5.0, counter.Value)
+	assert.Equal(t, 5.0, counter.Sum)
 
 	expTime := time.Date(2023, time.May, 1, 1, 1, 16, int(500*time.Millisecond), time.UTC)
 	assert.Equal(t, expTime, buckets[0].Time)
