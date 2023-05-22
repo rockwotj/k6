@@ -22,30 +22,25 @@ import (
 type Output struct {
 	output.SampleBuffer
 
-	logger       logrus.FieldLogger
-	config       cloudapi.Config
-	referenceID  string
-	testStopFunc func(error)
+	logger                logrus.FieldLogger
+	config                cloudapi.Config
+	referenceID           string
+	testStopFunc          func(error)
+	stopMetricsCollection chan struct{}
 
 	flushing        *metricsFlushing
 	periodicFlusher *output.PeriodicFlusher
 
 	collector         *collector
 	periodicCollector *output.PeriodicFlusher
-
-	// TODO: rename; this is an old name from v1
-	// it now stops the entry point to buffering samples
-	//
-	// What about stopMetricCollection
-	// Does it sound better?
-	stopSendingMetrics chan struct{}
 }
 
 // New creates a new cloud output.
 func New(logger logrus.FieldLogger, conf cloudapi.Config) (*Output, error) {
 	return &Output{
-		config: conf,
-		logger: logger.WithFields(logrus.Fields{"output": "cloudv2"}),
+		config:                conf,
+		logger:                logger.WithFields(logrus.Fields{"output": "cloudv2"}),
+		stopMetricsCollection: make(chan struct{}),
 	}, nil
 }
 
@@ -106,7 +101,9 @@ func (o *Output) Start() error {
 // StopWithTestError gracefully stops all metric emission from the output.
 func (o *Output) StopWithTestError(testErr error) error {
 	o.logger.Debug("Stopping...")
+	close(o.stopMetricsCollection)
 
+	o.collector.SetNoDelayOnFlush()
 	o.periodicCollector.Stop()
 	o.periodicFlusher.Stop()
 
@@ -120,7 +117,7 @@ func (o *Output) AddMetricSamples(s []metrics.SampleContainer) {
 	// evaluate to do something smarter, maybe having a lock-free
 	// queue.
 	select {
-	case <-o.stopSendingMetrics:
+	case <-o.stopMetricsCollection:
 		// TODO: unit test this case
 		return
 	default:
@@ -196,7 +193,7 @@ func (o *Output) handleFlushError(err error) {
 	}
 
 	o.logger.WithError(err).Warn("Interrupt sending metrics to cloud due to an error")
-	close(o.stopSendingMetrics)
+	close(o.stopMetricsCollection)
 
 	if o.config.StopOnError.Bool {
 		serr := errext.WithAbortReasonIfNone(

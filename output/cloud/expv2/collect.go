@@ -85,6 +85,12 @@ func (c *collector) CollectSamples(containers []metrics.SampleContainer) {
 	c.bq.Push(expired)
 }
 
+// SetNoDelayOnFlush drops the waiting time for buckets
+// for the expiring checks.
+func (c *collector) SetNoDelayOnFlush() {
+	c.waitPeriod = 0
+}
+
 func (c *collector) collectSample(s metrics.Sample) {
 	bucketID := c.bucketID(s.Time)
 
