@@ -170,7 +170,7 @@ func TestOutputHandleFlushError(t *testing.T) {
 				testStopFunc: func(error) {
 					stopFuncCalled = true
 				},
-				stopSendingMetrics: make(chan struct{}),
+				stopMetricsCollection: make(chan struct{}),
 			}
 			o.config.StopOnError = null.BoolFrom(tc.abort)
 
@@ -182,7 +182,7 @@ func TestOutputHandleFlushError(t *testing.T) {
 
 				<-done
 				select {
-				case <-o.stopSendingMetrics:
+				case <-o.stopMetricsCollection:
 					stopMetricCollection = true
 				default:
 				}
