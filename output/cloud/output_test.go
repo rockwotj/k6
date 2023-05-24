@@ -20,7 +20,6 @@ import (
 	"go.k6.io/k6/metrics"
 	"go.k6.io/k6/output"
 	cloudv2 "go.k6.io/k6/output/cloud/expv2"
-	cloudv1 "go.k6.io/k6/output/cloud/v1"
 	"gopkg.in/guregu/null.v3"
 )
 
@@ -178,23 +177,18 @@ func TestOutputStartVersionedOutputV2(t *testing.T) {
 	assert.True(t, ok)
 }
 
-func TestOutputStartVersionedOutputV1(t *testing.T) {
+func TestOutputStartVersionedOutputV1Error(t *testing.T) {
 	t.Parallel()
 
 	o := Output{
 		referenceID: "123",
 		config: cloudapi.Config{
 			APIVersion: null.IntFrom(1),
-			// Here, we are enabling but silencing the related async op
-			MetricPushInterval: types.NullDurationFrom(1 * time.Hour),
 		},
 	}
 
 	err := o.startVersionedOutput()
-	require.NoError(t, err)
-
-	_, ok := o.versionedOutput.(*cloudv1.Output)
-	assert.True(t, ok)
+	assert.ErrorContains(t, err, "not supported anymore")
 }
 
 func TestOutputStartWithReferenceID(t *testing.T) {

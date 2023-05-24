@@ -39,9 +39,10 @@ func NewMetricsClient(logger logrus.FieldLogger, host string, token string) (*Me
 	if host == "" {
 		return nil, errors.New("host is required")
 	}
-	if token == "" {
-		return nil, errors.New("token is required")
-	}
+	// TODO:
+	//if token == "" {
+	//return nil, errors.New("token is required")
+	//}
 	return &MetricsClient{
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		logger:     logger,
