@@ -101,12 +101,14 @@ func (o *Output) Start() error {
 // StopWithTestError gracefully stops all metric emission from the output.
 func (o *Output) StopWithTestError(testErr error) error {
 	o.logger.Debug("Stopping...")
+
 	close(o.stopMetricsCollection)
+	o.periodicCollector.Stop()
 
 	o.collector.SetNoDelayOnFlush()
-	o.periodicCollector.Stop()
-	o.periodicFlusher.Stop()
+	o.collector.CollectSamples(nil)
 
+	o.periodicFlusher.Stop()
 	o.logger.Debug("Stopped!")
 	return nil
 }
