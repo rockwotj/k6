@@ -150,20 +150,9 @@ func NewConfig() Config {
 		MetricPushConcurrency:      null.NewInt(1, false),
 		MaxMetricSamplesPerPackage: null.NewInt(100000, false),
 		Timeout:                    types.NewNullDuration(1*time.Minute, false),
-		APIVersion:                 null.NewInt(1, false),
-		// Aggregation is disabled by default, since AggregationPeriod has no default value
-		// but if it's enabled manually or from the cloud service, those are the default values it will use:
-		AggregationCalcInterval:         types.NewNullDuration(3*time.Second, false),
-		AggregationWaitPeriod:           types.NewNullDuration(5*time.Second, false),
-		AggregationMinSamples:           null.NewInt(25, false),
-		AggregationOutlierAlgoThreshold: null.NewInt(75, false),
-		AggregationOutlierIqrRadius:     null.NewFloat(0.25, false),
-
-		// Since we're measuring durations, the upper coefficient is slightly
-		// lower, since outliers from that side are more interesting than ones
-		// close to zero.
-		AggregationOutlierIqrCoefLower: null.NewFloat(1.5, false),
-		AggregationOutlierIqrCoefUpper: null.NewFloat(1.3, false),
+		APIVersion:                 null.NewInt(2, false),
+		AggregationPeriod:          types.NewNullDuration(3*time.Second, false),
+		AggregationWaitPeriod:      types.NewNullDuration(8*time.Second, false),
 	}
 }
 
