@@ -106,14 +106,14 @@ func (mc *MetricsClient) Push(ctx context.Context, referenceID string, samples *
 	return nil
 }
 
-const b100KiB = 100 * 1024
+const payloadSizeLimit = 100 * 1024 // 100 KiB
 
 func newRequestBody(data *pbcloud.MetricSet) ([]byte, error) {
 	b, err := proto.Marshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("encoding metrics as Protobuf write request failed: %w", err)
 	}
-	if len(b) > b100KiB {
+	if len(b) > payloadSizeLimit {
 		return nil, fmt.Errorf("the Protobuf message is too large to be handled from the Cloud processor; "+
 			"size: %d, limit: 100 KB", len(b))
 	}
